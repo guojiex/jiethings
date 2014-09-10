@@ -1,9 +1,9 @@
-[d,sr] = wavread('abc.wav')  
+#[d,sr] = wavread('abc.wav')  
 d is sound signal,floating points, a vector  
 sr is the sample rate (FS) in Hertz  
 
 ***
-specgram(d, 256, sr);  
+#specgram(d, 256, sr);  
 spectrogram(d,256,128,128,sr);  
 Window 256, is the window length,to replace specgram,set it to 256 Hann window
 Noverlap 128, is the number of overlapping segments that produces 50% overlap between segments.It should be less than the window.  
