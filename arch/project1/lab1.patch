@@ -1,0 +1,878 @@
+diff --git a/.gitignore b/.gitignore
+index 8c373c6..c6309b5 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -9,3 +9,5 @@ cscope.out
+ m5out
+ src/doxygen
+ mibench
++branch_pred.txt
++log
+diff --git a/benchmarks-compile.sh b/benchmarks-compile.sh
+index 64ba639..0838507 100755
+--- a/benchmarks-compile.sh
++++ b/benchmarks-compile.sh
+@@ -1,6 +1,10 @@
+ #!/bin/sh
+ # Extracts MiBench Suite and builds following benchmarks:
+-#	1. consumer/jpeg #	2. automotive/qsort #	3. network/dijkstra #	4. office/stringsearch  #	5. telecomm/FFT
++#	1. consumer/jpeg
++#	2. automotive/qsort
++#	3. network/dijkstra
++#	4. office/stringsearch 
++#	5. telecomm/FFT
+ #
+ # Author: Naman Jain <namanj@cmu.edu>
+ #
+diff --git a/configs/common/Options.py b/configs/common/Options.py
+index 2cca4ef..d4bd2f0 100644
+--- a/configs/common/Options.py
++++ b/configs/common/Options.py
+@@ -197,6 +197,12 @@ def addCommonOptions(parser):
+     parser.add_option("--at-instruction", action="store_true", default=False,
+         help="""Treat value of --checkpoint-restore or --take-checkpoint as a
+                 number of instructions.""")
++    parser.add_option("--pred-type", default="tournament", type="choice", 
++                      choices=['local', 'tournament', 'bi-mode', 'gshare', 'yags'])
++    parser.add_option("--local-pred-size", type="int", default=2048)
++    parser.add_option("--global-pred-size", type="int", default=8192)
++    parser.add_option("--choice-pred-size", type="int", default=8192)
++
+ 
+ def addSEOptions(parser):
+     # Benchmark options
+diff --git a/configs/example/se.py b/configs/example/se.py
+index f7e7f1a..566ffd3 100644
+--- a/configs/example/se.py
++++ b/configs/example/se.py
+@@ -158,6 +158,12 @@ MemClass = Simulation.setMemClass(options)
+ if options.smt and options.num_cpus > 1:
+     fatal("You cannot use SMT with multiple CPUs!")
+ 
++# BranchPredictor Type addition in cmd line
++BranchPredictor.predType = options.pred_type
++BranchPredictor.localPredictorSize = options.local_pred_size
++BranchPredictor.globalPredictorSize = options.global_pred_size
++BranchPredictor.choicePredictorSize = options.choice_pred_size
++
+ np = options.num_cpus
+ system = System(cpu = [CPUClass(cpu_id=i) for i in xrange(np)],
+                 mem_mode = test_mem_mode,
+diff --git a/parse_branch_data.py b/parse_branch_data.py
+new file mode 100755
+index 0000000..3e7e256
+--- /dev/null
++++ b/parse_branch_data.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/python
++#
++# Helps analyze branch predictor stats generated
++# Extracts data of importance from m5out/*.stat files
++# and writes result to branch_pred.txt
++#
++# Author: Naman Jain <namanj@cmu.edu>
++#
++
++import os
++import glob
++
++res = open("branch_pred.txt", "w")
++
++os.chdir("./m5out/")
++for nfile in sorted(glob.glob("*.stat")):
++	res.write(nfile + "\n")
++	res.write("----------------------------------------------------\n")
++	search = open(nfile, "r")
++	while True:
++		line = search.readline()
++		if "system.cpu.numCycles" in line:
++			res.write("Num Cycles: " + (line.split(None))[1] + "\n")
++		elif "system.cpu.fetch.Cycles" in line:
++			cycles = float((line.split(None))[1])
++			line = search.readline()
++			res.write("Percentage Fetch Squashed: " + str(100 - (float((line.split(None))[1])/cycles*100)) + "\n")
++		elif "system.cpu.fetch.branchRate" in line:
++			res.write("Branch Rate: " + (line.split(None))[1] + "\n")
++		elif "system.cpu.branchPred.lookups" in line:
++			line = search.readline()
++			condPredicted = (line.split(None))[1]
++			line = search.readline()
++			condIncorrect = (line.split(None))[1]
++			for i in range(4):
++				line = search.readline()
++			BTBHit = (line.split(None))[1]
++			line = search.readline()
++			RASUsed = (line.split(None))[1]
++			line = search.readline()
++			RASIncorrect = (line.split(None))[1]
++			predRate = 100 - (float(condIncorrect)/float(condPredicted))*100
++			RASPredRate = 100 - (float(RASIncorrect)/float(RASUsed))*100
++			res.write("Correct Prediction:" + str(predRate) + "\n")
++			res.write("BTB Hit Rate:" + str(BTBHit) + "\n")
++			res.write("RAS Prediction:" + str(RASPredRate) + "\n")
++		elif "system.cpu.ipc" in line:
++			res.write("IPC: " + (line.split(None))[1] + "\n")
++			search.close()
++			res.write("----------------------------------------------------\n")
++			break
++res.close()
+diff --git a/src/cpu/pred/BranchPredictor.py b/src/cpu/pred/BranchPredictor.py
+index 07fc840..378b51f 100644
+--- a/src/cpu/pred/BranchPredictor.py
++++ b/src/cpu/pred/BranchPredictor.py
+@@ -36,7 +36,7 @@ class BranchPredictor(SimObject):
+ 
+     numThreads = Param.Unsigned(1, "Number of threads")
+     predType = Param.String("tournament",
+-        "Branch predictor type ('local', 'tournament')")
++        "Branch predictor type ('local', 'tournament', 'bi-mode', 'gshare', 'yags')")
+     localPredictorSize = Param.Unsigned(2048, "Size of local predictor")
+     localCtrBits = Param.Unsigned(2, "Bits per counter")
+     localHistoryTableSize = Param.Unsigned(2048, "Size of local history table")
+diff --git a/src/cpu/pred/SConscript b/src/cpu/pred/SConscript
+index d30a7a0..eab50fb 100644
+--- a/src/cpu/pred/SConscript
++++ b/src/cpu/pred/SConscript
+@@ -38,5 +38,8 @@ if 'InOrderCPU' in env['CPU_MODELS'] or 'O3CPU' in env['CPU_MODELS']:
+     Source('btb.cc')
+     Source('ras.cc')
+     Source('tournament.cc')
++    Source('bi_mode.cc')
++    Source('gshare.cc')
++    Source('yags.cc')
+     DebugFlag('FreeList')
+     DebugFlag('Branch')
+diff --git a/src/cpu/pred/bi_mode.cc b/src/cpu/pred/bi_mode.cc
+new file mode 100644
+index 0000000..cb4365e
+--- /dev/null
++++ b/src/cpu/pred/bi_mode.cc
+@@ -0,0 +1,245 @@
++/*
++ * Copyright (c) 2014 The Regents of The University of Michigan
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met: redistributions of source code must retain the above copyright
++ * notice, this list of conditions and the following disclaimer;
++ * redistributions in binary form must reproduce the above copyright
++ * notice, this list of conditions and the following disclaimer in the
++ * documentation and/or other materials provided with the distribution;
++ * neither the name of the copyright holders nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * Authors: Anthony Gutierrez
++ */
++
++/* @file
++ * Implementation of a bi-mode branch predictor
++ */
++
++#include "base/bitfield.hh"
++#include "base/intmath.hh"
++#include "cpu/pred/bi_mode.hh"
++
++BiModeBP::BiModeBP(const Params *params)
++    : BPredUnit(params), instShiftAmt(params->instShiftAmt),
++      globalHistoryReg(0),
++      globalHistoryBits(ceilLog2(params->globalPredictorSize)),
++      choicePredictorSize(params->choicePredictorSize),
++      choiceCtrBits(params->choiceCtrBits),
++      globalPredictorSize(params->globalPredictorSize),
++      globalCtrBits(params->globalCtrBits)
++{
++    if (!isPowerOf2(choicePredictorSize))
++        fatal("Invalid choice predictor size.\n");
++    if (!isPowerOf2(globalPredictorSize))
++        fatal("Invalid global history predictor size.\n");
++
++    choiceCounters.resize(choicePredictorSize);
++    takenCounters.resize(globalPredictorSize);
++    notTakenCounters.resize(globalPredictorSize);
++
++    for (int i = 0; i < choicePredictorSize; ++i) {
++        choiceCounters[i].setBits(choiceCtrBits);
++    }
++    for (int i = 0; i < globalPredictorSize; ++i) {
++        takenCounters[i].setBits(globalCtrBits);
++        notTakenCounters[i].setBits(globalCtrBits);
++    }
++
++    historyRegisterMask = mask(globalHistoryBits);
++    choiceHistoryMask = choicePredictorSize - 1;
++    globalHistoryMask = globalPredictorSize - 1;
++
++    choiceThreshold = (ULL(1) << (choiceCtrBits - 1)) - 1;
++    takenThreshold = (ULL(1) << (choiceCtrBits - 1)) - 1;
++    notTakenThreshold = (ULL(1) << (choiceCtrBits - 1)) - 1;
++}
++
++/*
++ * For an unconditional branch we set its history such that
++ * everything is set to taken. I.e., its choice predictor
++ * chooses the taken array and the taken array predicts taken.
++ */
++void
++BiModeBP::uncondBranch(void * &bpHistory)
++{
++    BPHistory *history = new BPHistory;
++    history->globalHistoryReg = globalHistoryReg;
++    history->takenUsed = true;
++    history->takenPred = true;
++    history->notTakenPred = true;
++    history->finalPred = true;
++    bpHistory = static_cast<void*>(history);
++    updateGlobalHistReg(true);
++}
++
++void
++BiModeBP::squash(void *bpHistory)
++{
++    BPHistory *history = static_cast<BPHistory*>(bpHistory);
++    globalHistoryReg = history->globalHistoryReg;
++
++    delete history;
++}
++
++/*
++ * Here we lookup the actual branch prediction. We use the PC to
++ * identify the bias of a particular branch, which is based on the
++ * prediction in the choice array. A hash of the global history
++ * register and a branch's PC is used to index into both the taken
++ * and not-taken predictors, which both present a prediction. The
++ * choice array's prediction is used to select between the two
++ * direction predictors for the final branch prediction.
++ */
++bool
++BiModeBP::lookup(Addr branchAddr, void * &bpHistory)
++{
++    unsigned choiceHistoryIdx = ((branchAddr >> instShiftAmt)
++                                & choiceHistoryMask);
++    unsigned globalHistoryIdx = (((branchAddr >> instShiftAmt)
++                                ^ globalHistoryReg)
++                                & globalHistoryMask);
++
++    assert(choiceHistoryIdx < choicePredictorSize);
++    assert(globalHistoryIdx < globalPredictorSize);
++
++    bool choicePrediction = choiceCounters[choiceHistoryIdx].read()
++                            > choiceThreshold;
++    bool takenGHBPrediction = takenCounters[globalHistoryIdx].read()
++                              > takenThreshold;
++    bool notTakenGHBPrediction = notTakenCounters[globalHistoryIdx].read()
++                                 > notTakenThreshold;
++    bool finalPrediction;
++
++    BPHistory *history = new BPHistory;
++    history->globalHistoryReg = globalHistoryReg;
++    history->takenUsed = choicePrediction;
++    history->takenPred = takenGHBPrediction;
++    history->notTakenPred = notTakenGHBPrediction;
++
++    if (choicePrediction) {
++        finalPrediction = takenGHBPrediction;
++    } else {
++        finalPrediction = notTakenGHBPrediction;
++    }
++
++    history->finalPred = finalPrediction;
++    bpHistory = static_cast<void*>(history);
++    updateGlobalHistReg(finalPrediction);
++
++    return finalPrediction;
++}
++
++void
++BiModeBP::btbUpdate(Addr branchAddr, void * &bpHistory)
++{
++    globalHistoryReg &= (historyRegisterMask & ~ULL(1));
++}
++
++/* Only the selected direction predictor will be updated with the final
++ * outcome; the status of the unselected one will not be altered. The choice
++ * predictor is always updated with the branch outcome, except when the
++ * choice is opposite to the branch outcome but the selected counter of
++ * the direction predictors makes a correct final prediction.
++ */
++void
++BiModeBP::update(Addr branchAddr, bool taken, void *bpHistory, bool squashed)
++{
++    if (bpHistory) {
++        BPHistory *history = static_cast<BPHistory*>(bpHistory);
++
++        unsigned choiceHistoryIdx = ((branchAddr >> instShiftAmt)
++                                    & choiceHistoryMask);
++        unsigned globalHistoryIdx = (((branchAddr >> instShiftAmt)
++                                    ^ globalHistoryReg)
++                                    & globalHistoryMask);
++
++        assert(choiceHistoryIdx < choicePredictorSize);
++        assert(globalHistoryIdx < globalPredictorSize);
++
++        if (history->takenUsed) {
++            // if the taken array's prediction was used, update it
++            if (taken) {
++                takenCounters[globalHistoryIdx].increment();
++            } else {
++                takenCounters[globalHistoryIdx].decrement();
++            }
++        } else {
++            // if the not-taken array's prediction was used, update it
++            if (taken) {
++                notTakenCounters[globalHistoryIdx].increment();
++            } else {
++                notTakenCounters[globalHistoryIdx].decrement();
++            }
++        }
++
++        if (history->finalPred == taken) {
++            /* If the final prediction matches the actual branch's
++             * outcome and the choice predictor matches the final
++             * outcome, we update the choice predictor, otherwise it
++             * is not updated. While the designers of the bi-mode
++             * predictor don't explicity say why this is done, one
++             * can infer that it is to preserve the choice predictor's
++             * bias with respect to the branch being predicted; afterall,
++             * the whole point of the bi-mode predictor is to identify the
++             * atypical case when a branch deviates from its bias.
++             */
++            if (history->finalPred == history->takenUsed) {
++                if (taken) {
++                    choiceCounters[choiceHistoryIdx].increment();
++                } else {
++                    choiceCounters[choiceHistoryIdx].decrement();
++                }
++            }
++        } else {
++            // always update the choice predictor on an incorrect prediction
++            if (taken) {
++                choiceCounters[choiceHistoryIdx].increment();
++            } else {
++                choiceCounters[choiceHistoryIdx].decrement();
++            }
++        }
++
++        if (squashed) {
++            if (taken) {
++                globalHistoryReg = (history->globalHistoryReg << 1) | 1;
++            } else {
++                globalHistoryReg = (history->globalHistoryReg << 1);
++            }
++            globalHistoryReg &= historyRegisterMask;
++        } else {
++            delete history;
++        }
++    }
++}
++
++void
++BiModeBP::retireSquashed(void *bp_history)
++{
++    BPHistory *history = static_cast<BPHistory*>(bp_history);
++    delete history;
++}
++
++void
++BiModeBP::updateGlobalHistReg(bool taken)
++{
++    globalHistoryReg = taken ? (globalHistoryReg << 1) | 1 :
++                               (globalHistoryReg << 1);
++    globalHistoryReg &= historyRegisterMask;
++}
+diff --git a/src/cpu/pred/bi_mode.hh b/src/cpu/pred/bi_mode.hh
+new file mode 100644
+index 0000000..a412d63
+--- /dev/null
++++ b/src/cpu/pred/bi_mode.hh
+@@ -0,0 +1,114 @@
++/*
++ * Copyright (c) 2014 The Regents of The University of Michigan
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met: redistributions of source code must retain the above copyright
++ * notice, this list of conditions and the following disclaimer;
++ * redistributions in binary form must reproduce the above copyright
++ * notice, this list of conditions and the following disclaimer in the
++ * documentation and/or other materials provided with the distribution;
++ * neither the name of the copyright holders nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * Authors: Anthony Gutierrez
++ */
++
++/* @file
++ * Implementation of a bi-mode branch predictor
++ */
++
++#ifndef __CPU_PRED_BI_MODE_PRED_HH__
++#define __CPU_PRED_BI_MODE_PRED_HH__
++
++#include "cpu/pred/bpred_unit.hh"
++#include "cpu/pred/sat_counter.hh"
++
++/**
++ * Implements a bi-mode branch predictor. The bi-mode predictor is a two-level
++ * branch predictor that has three seprate history arrays: a taken array, a
++ * not-taken array, and a choice array. The taken/not-taken arrays are indexed
++ * by a hash of the PC and the global history. The choice array is indexed by
++ * the PC only. Because the taken/not-taken arrays use the same index, they must
++ * be the same size.
++ *
++ * The bi-mode branch predictor aims to eliminate the destructive aliasing that
++ * occurs when two branches of opposite biases share the same global history
++ * pattern. By separating the predictors into taken/not-taken arrays, and using
++ * the branch's PC to choose between the two, destructive aliasing is reduced.
++ */
++
++class BiModeBP : public BPredUnit
++{
++  public:
++    BiModeBP(const Params *params);
++    void uncondBranch(void * &bp_history);
++    void squash(void *bp_history);
++    bool lookup(Addr branch_addr, void * &bp_history);
++    void btbUpdate(Addr branch_addr, void * &bp_history);
++    void update(Addr branch_addr, bool taken, void *bp_history, bool squashed);
++    void retireSquashed(void *bp_history);
++
++  private:
++    void updateGlobalHistReg(bool taken);
++
++    struct BPHistory {
++        unsigned globalHistoryReg;
++        // was the taken array's prediction used?
++        // true: takenPred used
++        // false: notPred used
++        bool takenUsed;
++        // prediction of the taken array
++        // true: predict taken
++        // false: predict not-taken
++        bool takenPred;
++        // prediction of the not-taken array
++        // true: predict taken
++        // false: predict not-taken
++        bool notTakenPred;
++        // the final taken/not-taken prediction
++        // true: predict taken
++        // false: predict not-taken
++        bool finalPred;
++    };
++
++    // choice predictors
++    std::vector<SatCounter> choiceCounters;
++    // taken direction predictors
++    std::vector<SatCounter> takenCounters;
++    // not-taken direction predictors
++    std::vector<SatCounter> notTakenCounters;
++
++    unsigned instShiftAmt;
++
++    unsigned globalHistoryReg;
++    unsigned globalHistoryBits;
++    unsigned historyRegisterMask;
++
++    unsigned choicePredictorSize;
++    unsigned choiceCtrBits;
++    unsigned choiceHistoryMask;
++    unsigned globalPredictorSize;
++    unsigned globalCtrBits;
++    unsigned globalHistoryMask;
++
++    unsigned choiceThreshold;
++    unsigned takenThreshold;
++    unsigned notTakenThreshold;
++};
++
++#endif // __CPU_PRED_BI_MODE_PRED_HH__
+diff --git a/src/cpu/pred/bpred_unit.cc b/src/cpu/pred/bpred_unit.cc
+index 52a7711..3fd2a6f 100644
+--- a/src/cpu/pred/bpred_unit.cc
++++ b/src/cpu/pred/bpred_unit.cc
+@@ -34,6 +34,9 @@
+ #include "cpu/pred/2bit_local.hh"
+ #include "cpu/pred/bpred_unit_impl.hh"
+ #include "cpu/pred/tournament.hh"
++#include "cpu/pred/bi_mode.hh"
++#include "cpu/pred/gshare.hh"
++#include "cpu/pred/yags.hh"
+ 
+ BPredUnit *
+ BranchPredictorParams::create()
+@@ -43,6 +46,12 @@ BranchPredictorParams::create()
+         return new LocalBP(this);
+     } else if (predType == "tournament") {
+         return new TournamentBP(this);
++    } else if (predType == "bi-mode") {
++    	return new BiModeBP(this);
++    } else if (predType == "gshare") {
++    	return new GshareBP(this);
++    } else if (predType == "yags") {
++    	return new YagsBP(this);
+     } else {
+         fatal("Invalid BP selected!");
+     }
+diff --git a/src/cpu/pred/gshare.cc b/src/cpu/pred/gshare.cc
+new file mode 100644
+index 0000000..90238ba
+--- /dev/null
++++ b/src/cpu/pred/gshare.cc
+@@ -0,0 +1,86 @@
++/* @file
++ * Implementation of a Gshare branch predictor
++ *
++ * 18-640 Foundations of Computer Architecture
++ * Carnegie Mellon University
++ *
++ */
++
++#include "base/bitfield.hh"
++#include "base/intmath.hh"
++#include "cpu/pred/gshare.hh"
++
++/*
++ * Constructor for YagsBP
++ */
++GshareBP::GshareBP(const Params *params)
++    : BPredUnit(params), instShiftAmt(params->instShiftAmt),
++      globalHistoryReg(0),
++      globalHistoryBits(ceilLog2(params->localPredictorSize)),
++      localPredictorSize(params->localPredictorSize),
++      localCtrBits(params->localCtrBits)
++{
++    
++}
++
++/*
++ * Reset Data Structures
++ */
++void
++GshareBP::reset()
++{
++    
++}
++
++/*
++ * Actions for an unconditional branch
++ */
++void
++GshareBP::uncondBranch(void * &bpHistory)
++{
++
++}
++
++/*
++ * Lookup the actual branch prediction.
++ */
++bool
++GshareBP::lookup(Addr branchAddr, void * &bpHistory)
++{
++    return true;
++}
++
++/*
++ * BTB Update actions
++ */
++void
++GshareBP::btbUpdate(Addr branchAddr, void * &bpHistory)
++{
++
++}
++
++/*
++ * Update data structures after getting actual decison 
++ */
++void
++GshareBP::update(Addr branchAddr, bool taken, void *bpHistory, bool squashed)
++{
++	
++}
++
++/*
++ * Global History Registor Update 
++ */
++void
++GshareBP::updateGlobalHistReg(bool taken)
++{
++    
++}
++
++/*
++ * Actions for squash
++ */
++void
++GshareBP::squash(void *bpHistory) {
++    
++}
+diff --git a/src/cpu/pred/gshare.hh b/src/cpu/pred/gshare.hh
+new file mode 100644
+index 0000000..2666c7b
+--- /dev/null
++++ b/src/cpu/pred/gshare.hh
+@@ -0,0 +1,57 @@
++/* @file
++ * Header file for Gshare branch predictor
++ * 
++ * 18-640 Foundations of Computer Architecture
++ * Carnegie Mellon University
++ *
++ */
++
++#ifndef __CPU_PRED_GSHARE_PRED_HH__
++#define __CPU_PRED_GSHARE_PRED_HH__
++
++#include "cpu/pred/bpred_unit.hh"
++#include "cpu/pred/sat_counter.hh"
++
++/*
++ * Feel free to make any modifications, this is a skeleton code
++ * to get you started.
++ * Note: Do not change name of class
++ */
++class GshareBP : public BPredUnit
++{
++  public:
++    GshareBP(const Params *params);
++    void uncondBranch(void * &bp_history);
++    void squash(void *bp_history);
++    bool lookup(Addr branch_addr, void * &bp_history);
++    void btbUpdate(Addr branch_addr, void * &bp_history);
++    void update(Addr branch_addr, bool taken, void *bp_history, bool squashed);
++    void reset();
++
++  private:
++    void updateGlobalHistReg(bool taken);
++
++    struct BPHistory {
++        unsigned globalHistoryReg;
++        bool finalPred;
++    };
++
++    unsigned instShiftAmt;
++
++    unsigned globalHistoryReg;
++    unsigned globalHistoryBits;
++    unsigned historyRegisterMask;
++
++    /** Local counters. */
++    std::vector<SatCounter> localCtrs;
++    /** Number of counters in the local predictor. */
++    unsigned localPredictorSize;
++    /** Number of bits of the local predictor's counters. */
++    unsigned localCtrBits;
++
++    unsigned localPredictorMask;
++
++    unsigned localThreshold;
++};
++
++#endif // __CPU_PRED_GSHARE_PRED_HH__
+diff --git a/src/cpu/pred/yags.cc b/src/cpu/pred/yags.cc
+new file mode 100644
+index 0000000..351cbb3
+--- /dev/null
++++ b/src/cpu/pred/yags.cc
+@@ -0,0 +1,90 @@
++/* @file
++ * Implementation of a YAGS branch predictor
++ *
++ * 18-640 Foundations of Computer Architecture
++ * Carnegie Mellon University
++ *
++ */
++
++#include "base/bitfield.hh"
++#include "base/intmath.hh"
++#include "cpu/pred/yags.hh"
++
++
++/*
++ * Constructor for YagsBP
++ */
++YagsBP::YagsBP(const Params *params)
++    : BPredUnit(params), instShiftAmt(params->instShiftAmt),
++      globalHistoryReg(0),
++      globalHistoryBits(ceilLog2(params->globalPredictorSize)),
++      choicePredictorSize(params->choicePredictorSize),
++      choiceCtrBits(params->choiceCtrBits),
++      globalPredictorSize(params->globalPredictorSize),
++      globalCtrBits(params->globalCtrBits)
++{
++    
++}
++
++/*
++ * Actions for an unconditional branch
++ */
++void
++YagsBP::uncondBranch(void * &bpHistory)
++{
++    
++}
++
++/*
++ * Actions for squash
++ */
++void
++YagsBP::squash(void *bpHistory)
++{
++    
++}
++
++/*
++ * Lookup the actual branch prediction.
++ */
++bool
++YagsBP::lookup(Addr branchAddr, void * &bpHistory)
++{
++    return true;
++}
++
++/*
++ * BTB Update actions
++ */
++void
++YagsBP::btbUpdate(Addr branchAddr, void * &bpHistory)
++{
++    
++}
++
++/*
++ * Update data structures after getting actual decison 
++ */
++void
++YagsBP::update(Addr branchAddr, bool taken, void *bpHistory, bool squashed)
++{
++    
++}
++
++/*
++ * Retire Squashed Instruction
++ */
++void
++YagsBP::retireSquashed(void *bp_history)
++{
++    
++}
++
++/*
++ * Global History Registor Update 
++ */
++void
++YagsBP::updateGlobalHistReg(bool taken)
++{
++    
++}
+diff --git a/src/cpu/pred/yags.hh b/src/cpu/pred/yags.hh
+new file mode 100644
+index 0000000..351ca69
+--- /dev/null
++++ b/src/cpu/pred/yags.hh
+@@ -0,0 +1,79 @@
++/* @file
++ * Header file for YAGS branch predictor
++ * 
++ * 18-640 Foundations of Computer Architecture
++ * Carnegie Mellon University
++ *
++ */
++
++#ifndef __CPU_PRED_YAGS_PRED_HH__
++#define __CPU_PRED_YAGS_PRED_HH__
++
++#include "cpu/pred/bpred_unit.hh"
++#include "cpu/pred/sat_counter.hh"
++
++/*
++ * Feel free to make any modifications, this is a skeleton code
++ * to get you started.
++ * Note: Do not change name of class
++ */
++class YagsBP : public BPredUnit
++{
++  public:
++    YagsBP(const Params *params);
++    void uncondBranch(void * &bp_history);
++    void squash(void *bp_history);
++    bool lookup(Addr branch_addr, void * &bp_history);
++    void btbUpdate(Addr branch_addr, void * &bp_history);
++    void update(Addr branch_addr, bool taken, void *bp_history, bool squashed);
++    void retireSquashed(void *bp_history);
++
++  private:
++    void updateGlobalHistReg(bool taken);
++
++    struct BPHistory {
++        unsigned globalHistoryReg;
++        // was the taken array's prediction used?
++        // true: takenPred used
++        // false: notPred used
++        bool takenUsed;
++        // prediction of the taken array
++        // true: predict taken
++        // false: predict not-taken
++        bool takenPred;
++        // prediction of the not-taken array
++        // true: predict taken
++        // false: predict not-taken
++        bool notTakenPred;
++        // the final taken/not-taken prediction
++        // true: predict taken
++        // false: predict not-taken
++        bool finalPred;
++    };
++
++    // choice predictors
++    std::vector<SatCounter> choiceCounters;
++    // taken direction predictors
++    std::vector<SatCounter> takenCounters;
++    // not-taken direction predictors
++    std::vector<SatCounter> notTakenCounters;
++
++    unsigned instShiftAmt;
++
++    unsigned globalHistoryReg;
++    unsigned globalHistoryBits;
++    unsigned historyRegisterMask;
++
++    unsigned choicePredictorSize;
++    unsigned choiceCtrBits;
++    unsigned choiceHistoryMask;
++    unsigned globalPredictorSize;
++    unsigned globalCtrBits;
++    unsigned globalHistoryMask;
++
++    unsigned choiceThreshold;
++    unsigned takenThreshold;
++    unsigned notTakenThreshold;
++};
++
++#endif // __CPU_PRED_YAGS_PRED_HH__
