@@ -1,0 +1,22 @@
+clear all
+load('F:\研一上学期\语音识别\test1\test1\DCTresult.txt')
+load('F:\研一上学期\语音识别\test1\test1\mel.txt')
+powerall=importdata('F:\研一上学期\语音识别\test1\test1\power.txt')
+for i=1:size(DCTresult,1)
+	myidct(i,:)=idct(DCTresult(i,:),40);
+end
+figure(1)
+imagesc(myidct')
+set(gca,'YDir','normal')
+figure(2)
+imagesc(log(mel'))
+set(gca,'YDir','normal')
+figure(3)
+imagesc(log(powerall'))
+set(gca,'YDir','normal') 
+dctnormalized=load('F:\研一上学期\语音识别\test1\test1\dctnormalized.txt')
+mean(dctnormalized(:,1))
+var(dctnormalized(:,1))
+figure(4)
+imagesc(dctnormalized')
+set(gca,'YDir','normal') 
